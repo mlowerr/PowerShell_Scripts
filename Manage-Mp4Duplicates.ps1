@@ -13,11 +13,14 @@ function Create-Shortcut {
 }
 
 param(
-    [string]$ReportFile = "DuplicateFilesReport.txt"
+    [string]$ReportFile = "Duplicate Files Report.txt"
 )
 
-# Create the 0-Duplicate folder in the script's directory if it doesn't exist
+# Resolve full path of 0-Duplicate folder in the script's directory
 $duplicateFolder = Join-Path -Path $PSScriptRoot -ChildPath "0-Duplicate"
+$duplicateFolder = [System.IO.Path]::GetFullPath($duplicateFolder)
+
+# Ensure 0-Duplicate exists
 if (-not (Test-Path -Path $duplicateFolder)) {
     New-Item -ItemType Directory -Path $duplicateFolder | Out-Null
 }
@@ -35,24 +38,27 @@ foreach ($line in $lines) {
     if ($line -notmatch "^\s") {
         # Process previous group
         if ($currentFilePaths.Count -gt 1 -and $currentFileGroup -like "*.mp4*") {
-            # Determine target filename
             $fileName = ($currentFileGroup -split " \(Size:")[0].Trim()
             $targetFilePath = Join-Path -Path $duplicateFolder -ChildPath $fileName
 
-            # If the file doesn't already exist in 0-Duplicate, copy one there
+            # If no copy in 0-Duplicate, move one there
             if (-not (Test-Path -Path $targetFilePath)) {
-                Copy-Item -Path $currentFilePaths[0] -Destination $targetFilePath -Force
+                $src = $currentFilePaths | Where-Object { -not ($_.StartsWith($duplicateFolder)) } | Select-Object -First 1
+                if ($src) {
+                    Move-Item -Path $src -Destination $targetFilePath -Force
+                }
             }
 
-            # For all paths, delete the file and replace with shortcut
+            # Delete all .mp4 files NOT in 0-Duplicate and replace with shortcut
             foreach ($path in $currentFilePaths) {
-                if ($path -ne $targetFilePath) {
+                $fullPath = [System.IO.Path]::GetFullPath($path)
+                if (-not $fullPath.StartsWith($duplicateFolder)) {
                     try {
-                        Remove-Item -LiteralPath $path -Force
-                        $shortcutPath = [System.IO.Path]::ChangeExtension($path, "lnk")
+                        Remove-Item -LiteralPath $fullPath -Force
+                        $shortcutPath = [System.IO.Path]::ChangeExtension($fullPath, "lnk")
                         Create-Shortcut -targetFile $targetFilePath -shortcutPath $shortcutPath
                     } catch {
-                        Write-Warning "Failed to process path $_"
+                        Write-Warning "Failed to process fullPath: $_"
                     }
                 }
             }
@@ -66,26 +72,30 @@ foreach ($line in $lines) {
     }
 }
 
-# Final group processing
+# Final group
 if ($currentFilePaths.Count -gt 1 -and $currentFileGroup -like "*.mp4*") {
     $fileName = ($currentFileGroup -split " \(Size:")[0].Trim()
     $targetFilePath = Join-Path -Path $duplicateFolder -ChildPath $fileName
 
     if (-not (Test-Path -Path $targetFilePath)) {
-        Copy-Item -Path $currentFilePaths[0] -Destination $targetFilePath -Force
+        $src = $currentFilePaths | Where-Object { -not ($_.StartsWith($duplicateFolder)) } | Select-Object -First 1
+        if ($src) {
+            Move-Item -Path $src -Destination $targetFilePath -Force
+        }
     }
 
     foreach ($path in $currentFilePaths) {
-        if ($path -ne $targetFilePath) {
+        $fullPath = [System.IO.Path]::GetFullPath($path)
+        if (-not $fullPath.StartsWith($duplicateFolder)) {
             try {
-                Remove-Item -LiteralPath $path -Force
-                $shortcutPath = [System.IO.Path]::ChangeExtension($path, "lnk")
+                Remove-Item -LiteralPath $fullPath -Force
+                $shortcutPath = [System.IO.Path]::ChangeExtension($fullPath, "lnk")
                 Create-Shortcut -targetFile $targetFilePath -shortcutPath $shortcutPath
             } catch {
-                Write-Warning "Failed to process path $_"
+                Write-Warning "Failed to process fullPath: $_"
             }
         }
     }
 }
 
-Write-Host "`n✅ All duplicate .mp4 files processed. Kept one copy in: $duplicateFolder"
+Write-Host "`n✅ All duplicate .mp4 files processed. One copy preserved in: $duplicateFolder"
