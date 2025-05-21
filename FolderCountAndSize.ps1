@@ -14,7 +14,7 @@ $header | Out-File -Append -FilePath $OutputFile
 $divider | Out-File -Append -FilePath $OutputFile
 
 # Get all directories
-Get-ChildItem -Path $RootPath -Recurse -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+Get-ChildItem -Path $RootPath -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object {
     $folderPath = $_.FullName
     try {
         $files = Get-ChildItem -Path $folderPath -File -Force -ErrorAction SilentlyContinue
