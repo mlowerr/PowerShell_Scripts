@@ -1,0 +1,2 @@
+Get-ChildItem -Path "G:\" -Filter ".lnk" -Recurse -ErrorAction SilentlyContinue |
+Remove-Item -Force
