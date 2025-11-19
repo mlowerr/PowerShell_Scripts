@@ -1,0 +1,14 @@
+# PowerShell Scripts Overview
+
+This repository centers on a workflow for discovering duplicate media, cataloging folder sizes, and safely cleaning up redundant files. The table below summarizes each script/text helper so you can quickly choose the right tool for a task.
+
+| File | Core purpose | Key behaviors & noteworthy details | Primary output |
+| --- | --- | --- | --- |
+| `DirectoryList-RemovePrefix.ps1` | Strip a known prefix from folder names and log the trimmed values. | Recursively scans the selected root (default `G:\`). Filters directories whose names start with `"Prefix -"`, trims the prefix, and writes the cleaned names to the log so you can rename them later with confidence. | `DirectoryListPrefixRemoved.txt` list containing timestamp header and each sanitized directory name. |
+| `DuplicateFiles.ps1` | Inventory duplicate files by name and size. | Walks every file below the root, groups them by `Name + Length`, and emits each duplicate set with all member paths. Serves as the foundation for the GUI and MP4-specific cleanup scripts. | `DuplicateFilesReport.txt` with per-group headings and indented file paths. |
+| `FolderCountAndSize.ps1` | Report folder occupancy statistics. | Enumerates every directory tree, counts contained files, and computes total bytes per folder. Produces a fixed-width table sorted by full path for easy spreadsheet import. | `file count and size.txt` with header, divider, and formatted rows (`Path`, `File Count`, `Size (GB)`). |
+| `Manage-Mp4Duplicates.ps1` | Automate `.mp4` duplicate cleanup. | Reads the duplicate report, focuses on video groups, and ensures one canonical copy in `0-Duplicate`. Replaces other copies with `.lnk` shortcuts pointing at the preserved file by leveraging Windows shell COM automation. Retries folder creation when missing. | Physical `0-Duplicate` folder populated with kept videos, plus `.lnk` shortcuts created alongside removed files. |
+| `Process-DuplicateFileReport-GUI.ps1` | Manually curate duplicate sets. | Uses Windows Forms to show each duplicate group (from `DuplicateFilesReport.txt`) in a modal list box. The user's selection drives a generated deletion script so manual review happens before touching disk. | `delete-duplicates-script.txt` PowerShell script containing `Remove-Item` commands selected by the user. |
+| `mass delete command.txt` | Quick command snippet to remove stray shortcuts. | One-liner pipeline that finds every `.lnk` file under `G:\` and deletes it, perfect for cleaning up after the MP4 manager replaces duplicates with shortcuts. | No file—intended to be pasted/run directly in a console. |
+
+> **Tip:** Run `DuplicateFiles.ps1` first to produce a report. Feed that report into either the GUI (`Process-DuplicateFileReport-GUI.ps1`) for manual pruning or the automated MP4 manager (`Manage-Mp4Duplicates.ps1`). Finish by running the mass delete command if you want to remove the generated shortcuts.
