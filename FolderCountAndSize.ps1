@@ -1,3 +1,5 @@
+# EX: .\Clear-ReadOnly.ps1 -Paths "C:\Projects\Alpha", "D:\Backups\Beta", "C:\Notes.txt"
+
 param(
     [string]$RootPath = "G:\",                             # Root path to scan
     [string]$OutputFile = "file count and size.txt"        # Output report name
