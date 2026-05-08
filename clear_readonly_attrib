@@ -1,0 +1,20 @@
+param (
+    [Parameter(Mandatory=$true, Position=0)]
+    [string[]]$Paths
+)
+
+foreach ($Path in $Paths) {
+    if (Test-Path -Path $Path) {
+        Write-Host "Processing: $Path" -ForegroundColor Cyan
+        
+        # Get the root directory/file itself and all children
+        Get-ChildItem -Path $Path -Recurse -Force | ForEach-Object {
+            if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+            }
+        }
+    }
+    else {
+        Write-Warning "Path not found: $Path"
+    }
+}
