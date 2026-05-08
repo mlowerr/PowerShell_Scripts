@@ -1,3 +1,5 @@
+# EX: .\Clear-ReadOnly.ps1 -Paths "C:\Projects\Alpha", "D:\Backups\Beta", "C:\Notes.txt"
+
 param (
     [Parameter(Mandatory=$true, Position=0)]
     [string[]]$Paths
