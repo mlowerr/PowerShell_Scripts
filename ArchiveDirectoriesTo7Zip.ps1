@@ -284,6 +284,59 @@ function Complete-ProcessRecord {
     $ResultCounter.Failed++
 }
 
+function Wait-ForAnyRunningProcess {
+    param (
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RunningProcessMap
+    )
+
+    if ($RunningProcessMap.Count -eq 0) {
+        return
+    }
+
+    # Prefer Wait-Process -Any when available (Windows PowerShell 7+).
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $ProcessIds = @($RunningProcessMap.Keys)
+        Wait-Process -Id $ProcessIds -Any -ErrorAction SilentlyContinue
+        return
+    }
+
+    # PowerShell 5.1-compatible fallback: briefly wait on each process handle.
+    foreach ($ProcessId in @($RunningProcessMap.Keys)) {
+        $Record = $RunningProcessMap[$ProcessId]
+        if ($null -ne $Record -and -not $Record.Process.HasExited) {
+            [void]$Record.Process.WaitForExit(250)
+            if ($Record.Process.HasExited) {
+                return
+            }
+        }
+    }
+}
+
+function Complete-ExitedRunningProcesses {
+    param (
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RunningProcessMap,
+
+        [Parameter(Mandatory = $true)]
+        [switch]$SkipValidationSwitch,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$ResultCounter,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SevenZipPath
+    )
+
+    foreach ($ProcessId in @($RunningProcessMap.Keys)) {
+        $Record = $RunningProcessMap[$ProcessId]
+        if ($Record.Process.HasExited) {
+            Complete-ProcessRecord -Record $Record -SkipValidationSwitch:$SkipValidationSwitch -ResultCounter $ResultCounter -SevenZipPath $SevenZipPath
+            $RunningProcessMap.Remove($ProcessId)
+        }
+    }
+}
+
 foreach ($Directory in $Directories) {
 
     # Archive file name is the directory name followed by .7z.
@@ -342,30 +395,14 @@ foreach ($Directory in $Directories) {
     }
 
     while ($RunningProcesses.Count -ge $ConcurrentDirectories) {
-        $ProcessIds = @($RunningProcesses.Keys)
-        Wait-Process -Id $ProcessIds -Any
-
-        foreach ($ProcessId in @($RunningProcesses.Keys)) {
-            $Record = $RunningProcesses[$ProcessId]
-            if ($Record.Process.HasExited) {
-                Complete-ProcessRecord -Record $Record -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
-                $RunningProcesses.Remove($ProcessId)
-            }
-        }
+        Wait-ForAnyRunningProcess -RunningProcessMap $RunningProcesses
+        Complete-ExitedRunningProcesses -RunningProcessMap $RunningProcesses -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
     }
 }
 
 while ($RunningProcesses.Count -gt 0) {
-    $ProcessIds = @($RunningProcesses.Keys)
-    Wait-Process -Id $ProcessIds -Any
-
-    foreach ($ProcessId in @($RunningProcesses.Keys)) {
-        $Record = $RunningProcesses[$ProcessId]
-        if ($Record.Process.HasExited) {
-            Complete-ProcessRecord -Record $Record -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
-            $RunningProcesses.Remove($ProcessId)
-        }
-    }
+    Wait-ForAnyRunningProcess -RunningProcessMap $RunningProcesses
+    Complete-ExitedRunningProcesses -RunningProcessMap $RunningProcesses -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
 }
 
 Write-Host ""
