@@ -19,6 +19,24 @@
 
     Defaults to 1.
 
+.PARAMETER CollisionPolicy
+    Policy for handling pre-existing archive paths.
+
+    Fail          = mark as failure and continue processing others.
+    Skip          = skip the directory.
+    TimestampedName = write to a timestamped .7z path.
+
+.PARAMETER ThreadsPerArchive
+    Number of 7-Zip threads per archive.
+
+    If omitted, the script computes a safe default based on logical CPUs and
+    -ConcurrentDirectories.
+
+.PARAMETER SkipValidation
+    Skip post-create `7z t` validation.
+
+    Validation is enabled by default for data integrity.
+
 .EXAMPLE
     .\ArchiveDirectoriesTo7Zip.ps1
 
@@ -29,7 +47,18 @@
 param (
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 64)]
-    [int]$ConcurrentDirectories = 1
+    [int]$ConcurrentDirectories = 1,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Fail", "Skip", "TimestampedName")]
+    [string]$CollisionPolicy = "Fail",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 1024)]
+    [int]$ThreadsPerArchive,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipValidation
 )
 
 # Fail fast on script-level errors that are not explicitly handled.
@@ -55,6 +84,12 @@ if (-not $SevenZipExe) {
     throw "7z.exe was not found. Install 7-Zip or add 7z.exe to PATH."
 }
 
+# Compute default per-archive threading safely when omitted.
+if (-not $PSBoundParameters.ContainsKey("ThreadsPerArchive")) {
+    $LogicalCpuCount = [Environment]::ProcessorCount
+    $ThreadsPerArchive = [Math]::Max(1, [Math]::Floor($LogicalCpuCount / $ConcurrentDirectories))
+}
+
 # Get only direct child directories of the current directory.
 $Directories = Get-ChildItem -Path $RootPath -Directory
 
@@ -67,69 +102,217 @@ Write-Host "Root path: $RootPath"
 Write-Host "7-Zip executable: $SevenZipExe"
 Write-Host "Directories found: $($Directories.Count)"
 Write-Host "Concurrent directories: $ConcurrentDirectories"
+Write-Host "Threads per archive: $ThreadsPerArchive"
+Write-Host "Validation enabled: $(-not $SkipValidation.IsPresent)"
+Write-Host "Collision policy: $CollisionPolicy"
 Write-Host ""
 
 # Track active 7-Zip processes.
-$RunningProcesses = @()
+$RunningProcesses = @{}
+
+# Track outcomes.
+$ResultCounts = [ordered]@{
+    Success = 0
+    Warning = 0
+    Failed  = 0
+    Skipped = 0
+}
+
+function Get-ExitClassification {
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode
+    )
+
+    switch ($ExitCode) {
+        0 { return "Success" }
+        1 { return "Warning" }
+        default { return "Failed" }
+    }
+}
+
+function Resolve-ArchivePath {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$BaseArchivePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Policy
+    )
+
+    if (-not (Test-Path -LiteralPath $BaseArchivePath)) {
+        return [PSCustomObject]@{
+            Action      = "Use"
+            ArchivePath = $BaseArchivePath
+            Message     = "Target available"
+        }
+    }
+
+    switch ($Policy) {
+        "Fail" {
+            return [PSCustomObject]@{
+                Action      = "Fail"
+                ArchivePath = $BaseArchivePath
+                Message     = "Archive exists"
+            }
+        }
+        "Skip" {
+            return [PSCustomObject]@{
+                Action      = "Skip"
+                ArchivePath = $BaseArchivePath
+                Message     = "Archive exists"
+            }
+        }
+        "TimestampedName" {
+            $DirectoryPart = Split-Path -Path $BaseArchivePath -Parent
+            $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($BaseArchivePath)
+            $Extension = [System.IO.Path]::GetExtension($BaseArchivePath)
+            $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $NewPath = Join-Path $DirectoryPart "$BaseName.$Timestamp$Extension"
+
+            return [PSCustomObject]@{
+                Action      = "Use"
+                ArchivePath = $NewPath
+                Message     = "Archive exists; using timestamped target"
+            }
+        }
+    }
+}
+
+function Quarantine-Archive {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
+    )
+
+    if (-not (Test-Path -LiteralPath $ArchivePath)) {
+        return $null
+    }
+
+    $DirectoryPart = Split-Path -Path $ArchivePath -Parent
+    $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($ArchivePath)
+    $Extension = [System.IO.Path]::GetExtension($ArchivePath)
+    $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $QuarantinePath = Join-Path $DirectoryPart "$BaseName.partial.$Timestamp$Extension"
+
+    Move-Item -LiteralPath $ArchivePath -Destination $QuarantinePath -Force
+    return $QuarantinePath
+}
+
+function Complete-ProcessRecord {
+    param (
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record,
+
+        [Parameter(Mandatory = $true)]
+        [switch]$SkipValidationSwitch,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$ResultCounter,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SevenZipPath
+    )
+
+    $classification = Get-ExitClassification -ExitCode $Record.Process.ExitCode
+
+    if ($classification -eq "Success" -and -not $SkipValidationSwitch.IsPresent) {
+        $ValidationProcess = Start-Process `
+            -FilePath $SevenZipPath `
+            -ArgumentList @("t", "-y", $Record.ArchivePath) `
+            -NoNewWindow `
+            -PassThru
+
+        $ValidationProcess.WaitForExit()
+        $validationClass = Get-ExitClassification -ExitCode $ValidationProcess.ExitCode
+
+        if ($validationClass -ne "Success") {
+            Write-Host ""
+            Write-Host "ERROR: Archive validation failed; archive may be incomplete." -ForegroundColor Red
+            Write-Host "Directory: $($Record.DirectoryPath)" -ForegroundColor Red
+            Write-Host "Archive:   $($Record.ArchivePath)" -ForegroundColor Red
+            Write-Host "Validate exit code: $($ValidationProcess.ExitCode)" -ForegroundColor Red
+            $QuarantinePath = Quarantine-Archive -ArchivePath $Record.ArchivePath
+            if ($QuarantinePath) {
+                Write-Host "Quarantined: $QuarantinePath" -ForegroundColor Yellow
+            }
+            Write-Host ""
+
+            if ($validationClass -eq "Warning") {
+                $ResultCounter.Warning++
+            }
+            else {
+                $ResultCounter.Failed++
+            }
+            return
+        }
+    }
+
+    if ($classification -eq "Success") {
+        Write-Host "Finished: $($Record.DirectoryPath)"
+        $ResultCounter.Success++
+        return
+    }
+
+    if ($classification -eq "Warning") {
+        Write-Host ""
+        Write-Host "WARNING: 7-Zip returned a warning; archive may be incomplete." -ForegroundColor Yellow
+        Write-Host "Directory: $($Record.DirectoryPath)" -ForegroundColor Yellow
+        Write-Host "Archive:   $($Record.ArchivePath)" -ForegroundColor Yellow
+        Write-Host "Exit code: $($Record.Process.ExitCode)" -ForegroundColor Yellow
+        $QuarantinePath = Quarantine-Archive -ArchivePath $Record.ArchivePath
+        if ($QuarantinePath) {
+            Write-Host "Quarantined: $QuarantinePath" -ForegroundColor Yellow
+        }
+        Write-Host ""
+
+        $ResultCounter.Warning++
+        return
+    }
+
+    Write-Host ""
+    Write-Host "ERROR: 7-Zip failed; archive may be incomplete." -ForegroundColor Red
+    Write-Host "Directory: $($Record.DirectoryPath)" -ForegroundColor Red
+    Write-Host "Archive:   $($Record.ArchivePath)" -ForegroundColor Red
+    Write-Host "Exit code: $($Record.Process.ExitCode)" -ForegroundColor Red
+    $QuarantinePath = Quarantine-Archive -ArchivePath $Record.ArchivePath
+    if ($QuarantinePath) {
+        Write-Host "Quarantined: $QuarantinePath" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    $ResultCounter.Failed++
+}
 
 foreach ($Directory in $Directories) {
 
     # Archive file name is the directory name followed by .7z.
-    $ArchivePath = Join-Path $RootPath "$($Directory.Name).7z"
+    $BaseArchivePath = Join-Path $RootPath "$($Directory.Name).7z"
 
-    # Check whether the archive already exists before processing.
-    #
-    # This is an alert only:
-    #   - The directory is not re-zipped.
-    #   - The script continues processing other directories.
-    if (Test-Path -LiteralPath $ArchivePath) {
+    $ArchiveResolution = Resolve-ArchivePath -BaseArchivePath $BaseArchivePath -Policy $CollisionPolicy
+
+    Write-Host "Destination decision: $($ArchiveResolution.Action) - $($ArchiveResolution.Message)"
+    Write-Host "Directory: $($Directory.FullName)"
+    Write-Host "Archive:   $($ArchiveResolution.ArchivePath)"
+
+    if ($ArchiveResolution.Action -eq "Fail") {
+        Write-Host "ERROR: Archive collision policy is Fail. Marking as failed." -ForegroundColor Red
         Write-Host ""
-        Write-Host "ERROR: Archive already exists. Skipping directory." -ForegroundColor Red
-        Write-Host "Directory: $($Directory.FullName)" -ForegroundColor Red
-        Write-Host "Archive:   $ArchivePath" -ForegroundColor Red
-        Write-Host ""
+        $ResultCounts.Failed++
         continue
     }
 
-    Write-Host "Starting: $($Directory.FullName)"
-    Write-Host "Archive:  $ArchivePath"
+    if ($ArchiveResolution.Action -eq "Skip") {
+        Write-Host "SKIP: Archive collision policy is Skip." -ForegroundColor Yellow
+        Write-Host ""
+        $ResultCounts.Skipped++
+        continue
+    }
 
-    # 7-Zip arguments matching the screenshot settings.
-    #
-    # a
-    #   Add files to archive.
-    #
-    # -t7z
-    #   Archive format: 7z.
-    #
-    # -mx=9
-    #   Compression level: 9 / Ultra.
-    #
-    # -m0=LZMA2
-    #   Compression method: LZMA2.
-    #
-    # -md=256m
-    #   Dictionary size: 256 MB.
-    #
-    # -mfb=64
-    #   Word size / fast bytes: 64.
-    #
-    # -ms=16g
-    #   Solid block size: 16 GB.
-    #
-    # -mmt=16
-    #   Number of CPU threads: 16.
-    #
-    # -r
-    #   Recurse through subdirectories.
-    #
-    # -y
-    #   Assume Yes on all prompts.
-    #
-    # "."
-    #   Archive the recursive contents of the source directory.
-    #   The process working directory is set to the source directory,
-    #   so this avoids storing full absolute paths in the archive.
+    $ArchivePath = $ArchiveResolution.ArchivePath
+
+    Write-Host "Starting: $($Directory.FullName)"
+
     $SevenZipArgs = @(
         "a",
         "-t7z",
@@ -138,19 +321,13 @@ foreach ($Directory in $Directories) {
         "-md=256m",
         "-mfb=64",
         "-ms=16g",
-        "-mmt=16",
+        "-mmt=$ThreadsPerArchive",
         "-r",
         "-y",
         $ArchivePath,
         "."
     )
 
-    # Start 7-Zip as a normal external process.
-    #
-    # Important:
-    #   This does not use Start-Job.
-    #   Avoiding Start-Job prevents PSSessionStateBroken errors caused by
-    #   background PowerShell job transport issues.
     $Process = Start-Process `
         -FilePath $SevenZipExe `
         -ArgumentList $SevenZipArgs `
@@ -158,70 +335,52 @@ foreach ($Directory in $Directories) {
         -NoNewWindow `
         -PassThru
 
-    # Track which directory/archive this process belongs to.
-    $RunningProcesses += [PSCustomObject]@{
+    $RunningProcesses[$Process.Id] = [PSCustomObject]@{
         Process       = $Process
         DirectoryPath = $Directory.FullName
         ArchivePath   = $ArchivePath
     }
 
-    # Throttle active processes to the requested concurrency level.
-    while (($RunningProcesses | Where-Object { -not $_.Process.HasExited }).Count -ge $ConcurrentDirectories) {
+    while ($RunningProcesses.Count -ge $ConcurrentDirectories) {
+        $ProcessIds = @($RunningProcesses.Keys)
+        Wait-Process -Id $ProcessIds -Any
 
-        Start-Sleep -Seconds 1
-
-        # Check for completed processes.
-        foreach ($Item in @($RunningProcesses)) {
-            if ($Item.Process.HasExited) {
-
-                if ($Item.Process.ExitCode -eq 0) {
-                    Write-Host "Finished: $($Item.DirectoryPath)"
-                }
-                else {
-                    Write-Host ""
-                    Write-Host "ERROR: 7-Zip failed." -ForegroundColor Red
-                    Write-Host "Directory: $($Item.DirectoryPath)" -ForegroundColor Red
-                    Write-Host "Archive:   $($Item.ArchivePath)" -ForegroundColor Red
-                    Write-Host "Exit code: $($Item.Process.ExitCode)" -ForegroundColor Red
-                    Write-Host ""
-                }
-
-                # Remove completed process from tracking.
-                $RunningProcesses = $RunningProcesses | Where-Object {
-                    $_.Process.Id -ne $Item.Process.Id
-                }
+        foreach ($ProcessId in @($RunningProcesses.Keys)) {
+            $Record = $RunningProcesses[$ProcessId]
+            if ($Record.Process.HasExited) {
+                Complete-ProcessRecord -Record $Record -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
+                $RunningProcesses.Remove($ProcessId)
             }
         }
     }
 }
 
-# Wait for any remaining 7-Zip processes to finish.
 while ($RunningProcesses.Count -gt 0) {
+    $ProcessIds = @($RunningProcesses.Keys)
+    Wait-Process -Id $ProcessIds -Any
 
-    Start-Sleep -Seconds 1
-
-    foreach ($Item in @($RunningProcesses)) {
-        if ($Item.Process.HasExited) {
-
-            if ($Item.Process.ExitCode -eq 0) {
-                Write-Host "Finished: $($Item.DirectoryPath)"
-            }
-            else {
-                Write-Host ""
-                Write-Host "ERROR: 7-Zip failed." -ForegroundColor Red
-                Write-Host "Directory: $($Item.DirectoryPath)" -ForegroundColor Red
-                Write-Host "Archive:   $($Item.ArchivePath)" -ForegroundColor Red
-                Write-Host "Exit code: $($Item.Process.ExitCode)" -ForegroundColor Red
-                Write-Host ""
-            }
-
-            # Remove completed process from tracking.
-            $RunningProcesses = $RunningProcesses | Where-Object {
-                $_.Process.Id -ne $Item.Process.Id
-            }
+    foreach ($ProcessId in @($RunningProcesses.Keys)) {
+        $Record = $RunningProcesses[$ProcessId]
+        if ($Record.Process.HasExited) {
+            Complete-ProcessRecord -Record $Record -SkipValidationSwitch:$SkipValidation -ResultCounter $ResultCounts -SevenZipPath $SevenZipExe
+            $RunningProcesses.Remove($ProcessId)
         }
     }
 }
 
 Write-Host ""
 Write-Host "All archive jobs completed."
+Write-Host "Success: $($ResultCounts.Success)"
+Write-Host "Warning: $($ResultCounts.Warning)"
+Write-Host "Failed:  $($ResultCounts.Failed)"
+Write-Host "Skipped: $($ResultCounts.Skipped)"
+
+if ($ResultCounts.Warning -gt 0 -or $ResultCounts.Failed -gt 0) {
+    exit 2
+}
+
+if ($ResultCounts.Skipped -gt 0) {
+    exit 3
+}
+
+exit 0
